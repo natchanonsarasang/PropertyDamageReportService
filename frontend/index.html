@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Damage Report System</title>
+
+<style>
+body{
+  font-family: Arial;
+  background:#f4f6f8;
+  padding:40px;
+}
+
+.container{
+  max-width:600px;
+  margin:auto;
+  background:white;
+  padding:30px;
+  border-radius:10px;
+  box-shadow:0 2px 10px rgba(0,0,0,0.1);
+}
+
+h2{
+  text-align:center;
+}
+
+input,select,textarea{
+  width:100%;
+  padding:10px;
+  margin-top:8px;
+  margin-bottom:16px;
+  border:1px solid #ccc;
+  border-radius:6px;
+}
+
+button{
+  width:100%;
+  padding:12px;
+  background:#007bff;
+  color:white;
+  border:none;
+  border-radius:6px;
+  font-size:16px;
+  cursor:pointer;
+}
+
+button:hover{
+  background:#0056b3;
+}
+
+#result{
+  margin-top:20px;
+  padding:10px;
+  background:#eaf7ea;
+  border-radius:6px;
+}
+</style>
+</head>
+
+
+<body>
+
+<div class="container">
+
+<h2>Property Damage Report</h2>
+
+<form id="reportForm">
+
+<label>Incident ID</label>
+<input type="text" id="incidentId" required>
+
+<label>Damage Type</label>
+<select id="damageType">
+<option value="building">Building</option>
+<option value="vehicle">Vehicle</option>
+<option value="infrastructure">Infrastructure</option>
+<option value="utility">Utility</option>
+<option value="other">Other</option>
+</select>
+
+<label>Ownership Type</label>
+<select id="ownershipType">
+<option value="personal">Personal</option>
+<option value="public">Public</option>
+</select>
+
+<label>Description</label>
+<textarea id="description" required></textarea>
+
+<label>Location</label>
+<input type="text" id="location" required>
+
+<label>Reporter Name</label>
+<input type="text" id="reporterName" required>
+
+<label>Contact Phone</label>
+<input type="text" id="contactPhone" required>
+
+<button type="submit">Submit Report</button>
+
+</form>
+
+<div id="result"></div>
+
+</div>
+
+
+<script>
+
+const API_URL = "https://zj5oc3gb5l.execute-api.us-east-1.amazonaws.com/v1/damage-reports"
+
+document.getElementById("reportForm").addEventListener("submit", async function(e){
+
+e.preventDefault()
+
+const data = {
+  incidentId: document.getElementById("incidentId").value,
+  damageType: document.getElementById("damageType").value,
+  ownershipType: document.getElementById("ownershipType").value,
+  description: document.getElementById("description").value,
+  location: document.getElementById("location").value,
+  reporterName: document.getElementById("reporterName").value,
+  contactPhone: document.getElementById("contactPhone").value
+}
+
+try{
+
+const response = await fetch(API_URL,{
+  method:"POST",
+  headers:{
+    "Content-Type":"application/json"
+  },
+  body: JSON.stringify(data)
+})
+
+const result = await response.json()
+
+document.getElementById("result").innerHTML =
+"<b>Report Submitted!</b><br>" +
+"Report ID: "+ result.reportId +
+"<br>Status: "+ result.overallStatus
+
+}catch(error){
+
+document.getElementById("result").innerHTML =
+"<span style='color:red'>Error submitting report</span>"
+
+console.error(error)
+
+}
+
+})
+
+</script>
+
+</body>
+</html>
