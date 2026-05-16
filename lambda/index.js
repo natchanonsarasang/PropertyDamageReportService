@@ -7,11 +7,37 @@ const snsClient = new SNSClient({})
 
 const TABLE_NAME = process.env.TABLE_NAME
 const AGENCY_RESPONSE_TABLE = process.env.AGENCY_RESPONSE_TABLE
+const INCIDENTS_TABLE = process.env.INCIDENTS_TABLE
 const TOPIC_ARN = process.env.TOPIC_ARN
 
-exports.handler = async (event) => {
+// --- Custom Error Classes ---
+
+class ValidationError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = "ValidationError"
+    this.statusCode = 400
+    this.code = "VALIDATION_ERROR"
+  }
+}
+
+class NotFoundError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = "NotFoundError"
+    this.statusCode = 404
+    this.code = "NOT_FOUND"
+  }
+}
+
+// --- Handler ---
+
+exports.handler = async (event, context) => {
+
+  const traceId = context.awsRequestId
 
   console.log("Incoming event:", JSON.stringify(event))
+  console.log("TraceId:", traceId)
 
   const method = event.requestContext?.http?.method
   const path = event.rawPath
@@ -19,41 +45,69 @@ exports.handler = async (event) => {
   try {
 
     if (method === "OPTIONS") {
-      return createResponse(200, {})
+      return createResponse(200, {}, traceId)
+    }
+
+    if (method === "GET" && path === "/v1/incidents") {
+      return await getIncidents(event, traceId)
     }
 
     if (method === "POST" && path === "/v1/damage-reports") {
-      return await createDamageReport(event)
+      return await createDamageReport(event, traceId)
     }
 
     if (method === "GET" && path === "/v1/damage-reports") {
-      return await getAllReports(event)
+      return await getAllReports(event, traceId)
     }
 
     if (method === "GET" && path.startsWith("/v1/damage-reports/")) {
-      return await getReportById(event)
+      return await getReportById(event, traceId)
     }
 
     if (method === "POST" && path === "/v1/agency-responses") {
-      return await agencyResponse(event)
+      return await agencyResponse(event, traceId)
     }
 
-    return createResponse(404, { message: "Route not found" })
+    throw new NotFoundError("Route not found")
 
   } catch (error) {
 
-    console.error("Error:", error)
+    console.error("Error:", error, "TraceId:", traceId)
 
-    return createResponse(500, {
+    const statusCode = error.statusCode || 500
+    const code = error.code || "INTERNAL_ERROR"
+
+    return createResponse(statusCode, {
       error: {
-        code: "INTERNAL_ERROR",
-        message: error.message
+        code: code,
+        message: error.message,
+        traceId: traceId
       }
-    })
+    }, traceId)
   }
 }
 
-async function createDamageReport(event) {
+// --- Route Handlers ---
+
+async function getIncidents(event, traceId) {
+
+  const result = await dynamoClient.send(new ScanCommand({
+    TableName: INCIDENTS_TABLE
+  }))
+
+  const items = (result.Items || []).map(item => ({
+    incidentId: item.incidentId.S,
+    incidentType: item.incidentType.S,
+    incidentDescription: item.incidentDescription.S,
+    location: item.location.S,
+    status: item.status.S,
+    priority: item.priority.S
+  }))
+
+  return createResponse(200, { items }, traceId)
+}
+
+async function createDamageReport(event, traceId) {
 
   const body = JSON.parse(event.body || "{}")
 
@@ -64,20 +118,21 @@ async function createDamageReport(event) {
 
   await saveDamageReport(body, reportId, createdAt)
 
-  await publishEventToSNS(body, reportId, createdAt)
+  await publishEventToSNS(body, reportId, createdAt, traceId)
 
   await updateReportStatus(reportId)
 
   return createResponse(201, {
     reportId: reportId,
-    overallStatus: "forwarded",
+    overallStatus: "new",
     createdAt: createdAt
-  })
+  }, traceId)
 }
 
-async function getAllReports(event) {
+async function getAllReports(event, traceId) {
 
   const status = event.queryStringParameters?.status
+  const contactPhone = event.queryStringParameters?.contactPhone
 
   const params = {
     TableName: TABLE_NAME
@@ -99,18 +154,18 @@ async function getAllReports(event) {
     createdAt: item.createdAt.S
   }))
 
-  const filtered = status
-    ? reports.filter(r => r.overallStatus === status)
-    : reports
+  let filtered = reports
+  if (status) filtered = filtered.filter(r => r.overallStatus === status)
+  if (contactPhone) filtered = filtered.filter(r => r.contactPhone === contactPhone)
 
   return createResponse(200, {
-    reports: filtered
-  })
+    items: filtered
+  }, traceId)
 }
 
-async function getReportById(event) {
+async function getReportById(event, traceId) {
 
-  const reportId = event.rawPath.split("/").pop()
+  const reportId = event.pathParameters?.reportId
 
   const params = {
     TableName: TABLE_NAME,
@@ -122,7 +177,7 @@ async function getReportById(event) {
   const result = await dynamoClient.send(new GetItemCommand(params))
 
   if (!result.Item) {
-    return createResponse(404, { message: "Report not found" })
+    throw new NotFoundError("Report not found")
   }
 
   const item = result.Item
@@ -140,10 +195,10 @@ async function getReportById(event) {
     overallStatus: item.overallStatus.S,
     assignedAgency: item.assignedAgency?.S || null,
     createdAt: item.createdAt.S
-  })
+  }, traceId)
 }
 
-async function agencyResponse(event) {
+async function agencyResponse(event, traceId) {
 
   const body = JSON.parse(event.body || "{}")
 
@@ -155,11 +210,11 @@ async function agencyResponse(event) {
   } = body
 
   if (!reportId || !agencyName || !status) {
-    throw new Error("missing required field")
+    throw new ValidationError("missing required field")
   }
 
   if (!["accepted", "rejected"].includes(status)) {
-    throw new Error("invalid status")
+    throw new ValidationError("invalid status")
   }
 
   const responseId = "RESP-" + Date.now()
@@ -183,8 +238,10 @@ async function agencyResponse(event) {
     responseId: responseId,
     reportId: reportId,
     status: status
-  })
+  }, traceId)
 }
+
+// --- DynamoDB / SNS Helpers ---
 
 async function saveDamageReport(body, reportId, createdAt) {
 
@@ -246,11 +303,12 @@ async function updateReportHandled(reportId, agencyName) {
   await dynamoClient.send(new UpdateItemCommand(params))
 }
 
-async function publishEventToSNS(body, reportId, createdAt) {
+async function publishEventToSNS(body, reportId, createdAt, traceId) {
 
   const eventPayload = {
     eventType: "DamageReportForwarded",
     eventId: crypto.randomUUID(),
+    traceId: traceId,
     occurredAt: new Date().toISOString(),
     data: {
       reportId: reportId,
@@ -273,7 +331,7 @@ async function publishEventToSNS(body, reportId, createdAt) {
 
   const result = await snsClient.send(new PublishCommand(params))
 
-  console.log("SNS MessageId:", result.MessageId)
+  console.log("SNS MessageId:", result.MessageId, "TraceId:", traceId)
 
   return result.MessageId
 }
@@ -295,6 +353,8 @@ async function updateReportStatus(reportId) {
   await dynamoClient.send(new UpdateItemCommand(params))
 }
 
+// --- Validation ---
+
 function validateInput(body) {
 
   const {
@@ -308,7 +368,7 @@ function validateInput(body) {
   } = body
 
   if (!incidentId || !description || !location || !reporterName || !contactPhone) {
-    throw new Error("missing required field")
+    throw new ValidationError("missing required field")
   }
 
   const validDamageType = [
@@ -325,15 +385,17 @@ function validateInput(body) {
   ]
 
   if (!validDamageType.includes(damageType)) {
-    throw new Error("invalid damageType")
+    throw new ValidationError("invalid damageType")
   }
 
   if (!validOwnershipType.includes(ownershipType)) {
-    throw new Error("invalid ownershipType")
+    throw new ValidationError("invalid ownershipType")
   }
 }
 
-function createResponse(statusCode, body) {
+// --- Response Builder ---
+
+function createResponse(statusCode, body, traceId) {
 
   return {
     statusCode: statusCode,
@@ -341,7 +403,8 @@ function createResponse(statusCode, body) {
       "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Headers": "Content-Type",
-      "Access-Control-Allow-Methods": "OPTIONS,POST,GET"
+      "Access-Control-Allow-Methods": "OPTIONS,POST,GET",
+      "X-Trace-Id": traceId
     },
     body: JSON.stringify(body)
   }

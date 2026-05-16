@@ -16,16 +16,6 @@ Main components:
 
 ---
 
-# Features
-
-* Create a damage report
-* Retrieve a damage report by ID
-* List all damage reports
-* Handle agency responses
-* Event-driven communication using SNS/SQS
-
----
-
 # Project Structure
 
 ```
@@ -49,6 +39,7 @@ property-damage-report-service
 ---
 
 # API Endpoints
+Base URL: https://zj5oc3gb5l.execute-api.us-east-1.amazonaws.com/v1
 
 ## API Contract 1 Create Damage Report
 
@@ -248,6 +239,16 @@ Event details are documented in:
 
 docs/async-contract.md
 
+
+---
+
+# Features
+
+* Create a damage report
+* Retrieve a damage report by ID
+* List all damage reports
+* Handle agency responses
+* Event-driven communication using SNS/SQS
 
 ---
 
