@@ -1,16 +1,49 @@
 const { DynamoDBClient, PutItemCommand, UpdateItemCommand, GetItemCommand, ScanCommand } = require("@aws-sdk/client-dynamodb")
 const { SNSClient, PublishCommand } = require("@aws-sdk/client-sns")
+const { SQSClient, SendMessageCommand } = require("@aws-sdk/client-sqs")
 const crypto = require("crypto")
 
 const dynamoClient = new DynamoDBClient({})
 const snsClient = new SNSClient({})
+const sqsClient = new SQSClient({})
 
 const TABLE_NAME = process.env.TABLE_NAME
 const AGENCY_RESPONSE_TABLE = process.env.AGENCY_RESPONSE_TABLE
 const INCIDENTS_TABLE = process.env.INCIDENTS_TABLE
 const TOPIC_ARN = process.env.TOPIC_ARN
-
 const RESCUE_SERVICE_BASE_URL = process.env.RESCUE_SERVICE_BASE_URL
+const RESCUE_RETRY_QUEUE_URL = process.env.RESCUE_RETRY_QUEUE_URL
+
+// --- Structured Logger ---
+
+const logger = {
+  _log(level, message, fields = {}) {
+    console.log(JSON.stringify({
+      level,
+      message,
+      timestamp: new Date().toISOString(),
+      ...fields
+    }))
+  },
+  info(message, fields = {}) { this._log("INFO", message, fields) },
+  warn(message, fields = {}) { this._log("WARN", message, fields) },
+  error(message, fields = {}) { this._log("ERROR", message, fields) }
+}
+
+// --- Timer Utility ---
+
+function startTimer() {
+  const start = Date.now()
+  return { elapsed() { return Date.now() - start } }
+}
+
+// --- Cold Start Log ---
+
+logger.info("Lambda cold start initialized", {
+  region: process.env.AWS_REGION,
+  functionName: process.env.AWS_LAMBDA_FUNCTION_NAME,
+  functionVersion: process.env.AWS_LAMBDA_FUNCTION_VERSION
+})
 
 // --- Custom Error Classes ---
 
@@ -46,12 +79,18 @@ class RescueServiceError extends Error {
 exports.handler = async (event, context) => {
 
   const traceId = context.awsRequestId
-
-  console.log("[HANDLER] Incoming event:", JSON.stringify(event))
-  console.log("[HANDLER] TraceId:", traceId)
+  const handlerTimer = startTimer()
 
   const method = event.requestContext?.http?.method
   const path = event.rawPath
+
+  logger.info("Incoming request", {
+    traceId,
+    method,
+    path,
+    queryStringParameters: event.queryStringParameters || {},
+    sourceIp: event.requestContext?.http?.sourceIp
+  })
 
   try {
 
@@ -83,18 +122,37 @@ exports.handler = async (event, context) => {
 
   } catch (error) {
 
-    console.error("[HANDLER] Unhandled error:", error, "TraceId:", traceId)
-
     const statusCode = error.statusCode || 500
     const code = error.code || "INTERNAL_ERROR"
 
+    logger.error("Unhandled error", {
+      traceId,
+      method,
+      path,
+      errorName: error.name,
+      errorCode: code,
+      errorMessage: error.message,
+      stack: error.stack,
+      statusCode,
+      totalDurationMs: handlerTimer.elapsed()
+    })
+
     return createResponse(statusCode, {
       error: {
-        code: code,
+        code,
         message: error.message,
-        traceId: traceId
+        traceId
       }
     }, traceId)
+
+  } finally {
+
+    logger.info("Request completed", {
+      traceId,
+      method,
+      path,
+      totalDurationMs: handlerTimer.elapsed()
+    })
   }
 }
 
@@ -102,11 +160,10 @@ exports.handler = async (event, context) => {
 
 async function getIncidents(event, traceId) {
 
-  console.log("[GET /v1/incidents] Fetching all incidents, TraceId:", traceId)
+  const timer = startTimer()
+  logger.info("getIncidents start", { traceId })
 
-  const result = await dynamoClient.send(new ScanCommand({
-    TableName: INCIDENTS_TABLE
-  }))
+  const result = await dynamoClient.send(new ScanCommand({ TableName: INCIDENTS_TABLE }))
 
   const items = (result.Items || []).map(item => ({
     incidentId: item.incidentId.S,
@@ -117,51 +174,78 @@ async function getIncidents(event, traceId) {
     priority: item.priority.S
   }))
 
-  console.log("[GET /v1/incidents] Found:", items.length, "items, TraceId:", traceId)
+  logger.info("getIncidents done", { traceId, count: items.length, durationMs: timer.elapsed() })
 
   return createResponse(200, { items }, traceId)
 }
 
 async function createDamageReport(event, traceId) {
 
-  console.log("[POST /v1/damage-reports] Start, TraceId:", traceId)
+  const timer = startTimer()
+  logger.info("createDamageReport start", { traceId })
 
   const body = JSON.parse(event.body || "{}")
 
-  console.log("[POST /v1/damage-reports] Body:", JSON.stringify(body), "TraceId:", traceId)
+  logger.info("createDamageReport parsed body", {
+    traceId,
+    incidentId: body.incidentId,
+    damageType: body.damageType,
+    ownershipType: body.ownershipType,
+    location: body.location,
+    latitude: body.latitude,
+    longitude: body.longitude,
+    hasRescueRequest: !!body.rescueRequest
+  })
+
+  // ── Validate ทุกอย่างก่อน ไม่มีการ save/publish จนกว่าจะผ่านหมด ──
 
   validateInput(body)
+
+  if (body.rescueRequest && typeof body.rescueRequest === "object") {
+    logger.info("createDamageReport validating rescueRequest", { traceId })
+    validateRescueRequest(body.rescueRequest, body.incidentId)
+    logger.info("createDamageReport rescueRequest validation passed", { traceId })
+  }
+
+  // ── ผ่าน validate ทั้งหมดแล้ว ค่อยเริ่ม save ──
 
   const reportId = "REP-" + Date.now()
   const createdAt = new Date().toISOString()
 
-  console.log("[POST /v1/damage-reports] Generated reportId:", reportId, "TraceId:", traceId)
+  logger.info("createDamageReport generated reportId", { traceId, reportId })
 
   // Step 1 — Save damage report
-  console.log("[POST /v1/damage-reports] Step 1: Saving damage report to DynamoDB, TraceId:", traceId)
+  const step1Timer = startTimer()
+  logger.info("Step 1: Saving damage report to DynamoDB", { traceId, reportId })
   await saveDamageReport(body, reportId, createdAt)
-  console.log("[POST /v1/damage-reports] Step 1: Done, TraceId:", traceId)
+  logger.info("Step 1: Done", { traceId, reportId, durationMs: step1Timer.elapsed() })
 
-  // Step 2 — Publish to SNS (always, independent of rescueRequest)
-  console.log("[POST /v1/damage-reports] Step 2: Publishing to SNS, TraceId:", traceId)
+  // Step 2 — Publish to SNS
+  const step2Timer = startTimer()
+  logger.info("Step 2: Publishing to SNS", { traceId, reportId })
   await publishEventToSNS(body, reportId, createdAt, traceId)
-  console.log("[POST /v1/damage-reports] Step 2: Done, TraceId:", traceId)
+  logger.info("Step 2: Done", { traceId, reportId, durationMs: step2Timer.elapsed() })
 
   // Step 3 — Update status to forwarded
-  console.log("[POST /v1/damage-reports] Step 3: Updating report status to forwarded, TraceId:", traceId)
+  const step3Timer = startTimer()
+  logger.info("Step 3: Updating report status to forwarded", { traceId, reportId })
   await updateReportStatus(reportId)
-  console.log("[POST /v1/damage-reports] Step 3: Done, TraceId:", traceId)
+  logger.info("Step 3: Done", { traceId, reportId, durationMs: step3Timer.elapsed() })
 
-  // Step 4 — Optional: Forward rescue request (separate, does not affect SNS flow)
+  // Step 4 — Optional: Forward rescue request
   let rescueResult = null
 
   if (body.rescueRequest && typeof body.rescueRequest === "object") {
 
-    console.log("[POST /v1/damage-reports] Step 4: rescueRequest detected, validating, TraceId:", traceId)
-
-    validateRescueRequest(body.rescueRequest)
-
-    console.log("[POST /v1/damage-reports] Step 4: Forwarding to rescue service, TraceId:", traceId)
+    const step4Timer = startTimer()
+    logger.info("Step 4: Forwarding to rescue service", {
+      traceId,
+      reportId,
+      rescueServiceUrl: RESCUE_SERVICE_BASE_URL,
+      requestType: body.rescueRequest.requestType,
+      latitude: body.latitude,
+      longitude: body.longitude
+    })
 
     try {
 
@@ -169,21 +253,51 @@ async function createDamageReport(event, traceId) {
         rescueRequest: body.rescueRequest,
         incidentId: body.incidentId,
         reportId,
+        reporterName: body.reporterName,
+        contactPhone: body.contactPhone,
+        latitude: body.latitude,
+        longitude: body.longitude,
         traceId
       })
 
-      console.log("[POST /v1/damage-reports] Step 4: Rescue service success:", JSON.stringify(rescueResult), "TraceId:", traceId)
+      logger.info("Step 4: Rescue service success", {
+        traceId,
+        reportId,
+        requestId: rescueResult.requestId,
+        trackingCode: rescueResult.trackingCode,
+        status: rescueResult.status,
+        submittedAt: rescueResult.submittedAt,
+        durationMs: step4Timer.elapsed()
+      })
 
       await updateReportWithRescueInfo(reportId, rescueResult)
-
-      console.log("[POST /v1/damage-reports] Step 4: Rescue info saved to DynamoDB, TraceId:", traceId)
+      logger.info("Step 4: Rescue info saved to DynamoDB", { traceId, reportId })
 
     } catch (rescueError) {
 
-      console.error("[POST /v1/damage-reports] Step 4: Rescue service failed:", {
-        message: rescueError.message,
-        statusCode: rescueError.statusCode,
+      logger.error("Step 4: Rescue service failed", {
+        traceId,
+        reportId,
+        errorName: rescueError.name,
+        errorMessage: rescueError.message,
+        rescueStatusCode: rescueError.statusCode,
         rescueErrorBody: rescueError.rescueErrorBody || null,
+        stack: rescueError.stack,
+        durationMs: step4Timer.elapsed()
+      })
+
+      // บันทึก rescue status = failed ลง DynamoDB
+      await updateReportRescueFailed(reportId, rescueError)
+
+      // ส่ง payload เข้า SQS เพื่อ retry ทีหลัง
+      await enqueueRescueRetry({
+        reportId,
+        incidentId: body.incidentId,
+        rescueRequest: body.rescueRequest,
+        reporterName: body.reporterName,
+        contactPhone: body.contactPhone,
+        latitude: body.latitude,
+        longitude: body.longitude,
         traceId
       })
 
@@ -195,14 +309,15 @@ async function createDamageReport(event, traceId) {
     }
 
   } else {
-    console.log("[POST /v1/damage-reports] Step 4: No rescueRequest, skipping, TraceId:", traceId)
+    logger.info("Step 4: No rescueRequest, skipping", { traceId, reportId })
   }
 
-  // Build response
+  // ── Build response — contract เหมือนเดิมทุกอย่าง ──
+
   const responseBody = {
-    reportId: reportId,
+    reportId,
     overallStatus: "forwarded",
-    createdAt: createdAt
+    createdAt
   }
 
   if (rescueResult) {
@@ -223,25 +338,29 @@ async function createDamageReport(event, traceId) {
     }
   }
 
-  console.log("[POST /v1/damage-reports] Done. Response:", JSON.stringify(responseBody), "TraceId:", traceId)
+  logger.info("createDamageReport done", {
+    traceId,
+    reportId,
+    overallStatus: "forwarded",
+    rescueForwarded: rescueResult ? !rescueResult.error : null,
+    totalDurationMs: timer.elapsed()
+  })
 
   return createResponse(201, responseBody, traceId)
 }
 
 async function getAllReports(event, traceId) {
 
-  console.log("[GET /v1/damage-reports] Start, TraceId:", traceId)
+  const timer = startTimer()
 
   const status = event.queryStringParameters?.status
   const contactPhone = event.queryStringParameters?.contactPhone
 
-  console.log("[GET /v1/damage-reports] Filters — status:", status, "contactPhone:", contactPhone, "TraceId:", traceId)
+  logger.info("getAllReports start", { traceId, filters: { status, contactPhone } })
 
   const result = await dynamoClient.send(new ScanCommand({ TableName: TABLE_NAME }))
 
-  const items = result.Items || []
-
-  const reports = items.map(item => ({
+  const reports = (result.Items || []).map(item => ({
     reportId: item.reportId.S,
     incidentId: item.incidentId.S,
     damageType: item.damageType.S,
@@ -257,16 +376,23 @@ async function getAllReports(event, traceId) {
   if (status) filtered = filtered.filter(r => r.overallStatus === status)
   if (contactPhone) filtered = filtered.filter(r => r.contactPhone === contactPhone)
 
-  console.log("[GET /v1/damage-reports] Total:", reports.length, "After filter:", filtered.length, "TraceId:", traceId)
+  logger.info("getAllReports done", {
+    traceId,
+    totalCount: reports.length,
+    filteredCount: filtered.length,
+    filters: { status, contactPhone },
+    durationMs: timer.elapsed()
+  })
 
   return createResponse(200, { items: filtered }, traceId)
 }
 
 async function getReportById(event, traceId) {
 
+  const timer = startTimer()
   const reportId = event.pathParameters?.reportId
 
-  console.log("[GET /v1/damage-reports/:id] reportId:", reportId, "TraceId:", traceId)
+  logger.info("getReportById start", { traceId, reportId })
 
   const result = await dynamoClient.send(new GetItemCommand({
     TableName: TABLE_NAME,
@@ -274,7 +400,7 @@ async function getReportById(event, traceId) {
   }))
 
   if (!result.Item) {
-    console.warn("[GET /v1/damage-reports/:id] Not found:", reportId, "TraceId:", traceId)
+    logger.warn("getReportById not found", { traceId, reportId, durationMs: timer.elapsed() })
     throw new NotFoundError("Report not found")
   }
 
@@ -305,20 +431,27 @@ async function getReportById(event, traceId) {
     }
   }
 
-  console.log("[GET /v1/damage-reports/:id] Found:", reportId, "TraceId:", traceId)
+  logger.info("getReportById done", {
+    traceId,
+    reportId,
+    overallStatus: responseBody.overallStatus,
+    hasRescueRequest: !!item.rescueRequestId?.S,
+    durationMs: timer.elapsed()
+  })
 
   return createResponse(200, responseBody, traceId)
 }
 
 async function agencyResponse(event, traceId) {
 
-  console.log("[POST /v1/agency-responses] Start, TraceId:", traceId)
+  const timer = startTimer()
+  logger.info("agencyResponse start", { traceId })
 
   const body = JSON.parse(event.body || "{}")
 
-  console.log("[POST /v1/agency-responses] Body:", JSON.stringify(body), "TraceId:", traceId)
-
   const { reportId, agencyName, status, rejectReasonCode } = body
+
+  logger.info("agencyResponse parsed body", { traceId, reportId, agencyName, status, rejectReasonCode })
 
   if (!reportId || !agencyName || !status) {
     throw new ValidationError("missing required field")
@@ -334,52 +467,61 @@ async function agencyResponse(event, traceId) {
   await saveAgencyResponse({ responseId, reportId, agencyName, status, rejectReasonCode, now })
 
   if (status === "accepted") {
-    console.log("[POST /v1/agency-responses] Updating report as handled by:", agencyName, "TraceId:", traceId)
+    logger.info("agencyResponse: updating report as handled", { traceId, reportId, agencyName })
     await updateReportHandled(reportId, agencyName)
   }
 
-  console.log("[POST /v1/agency-responses] Done. responseId:", responseId, "TraceId:", traceId)
+  logger.info("agencyResponse done", {
+    traceId,
+    responseId,
+    reportId,
+    agencyName,
+    status,
+    durationMs: timer.elapsed()
+  })
 
   return createResponse(200, {
     message: "Agency response recorded",
-    responseId: responseId,
-    reportId: reportId,
-    status: status
+    responseId,
+    reportId,
+    status
   }, traceId)
 }
 
 // --- Rescue Request Helpers ---
 
-function validateRescueRequest(rescue) {
+const VALID_RESCUE_REQUEST_TYPES = ["MEDICAL", "EVACUATION", "SUPPLY"]
 
-  const required = ["incidentId", "requestType", "description", "latitude", "longitude", "contactName", "contactPhone"]
+function validateRescueRequest(rescue, parentIncidentId) {
+  // incidentId — ใช้จาก rescueRequest ถ้ามี ไม่งั้น fallback จาก report ด้านบน
+  const resolvedIncidentId = rescue.incidentId || parentIncidentId
+  if (!resolvedIncidentId) {
+    throw new ValidationError("rescueRequest missing required field: incidentId")
+  }
 
+  const required = ["requestType", "description"]
   for (const field of required) {
     if (rescue[field] === undefined || rescue[field] === null || rescue[field] === "") {
       throw new ValidationError(`rescueRequest missing required field: ${field}`)
     }
   }
 
-  if (typeof rescue.latitude !== "number" || rescue.latitude < -90 || rescue.latitude > 90) {
-    throw new ValidationError("rescueRequest.latitude must be a number between -90 and 90")
-  }
-
-  if (typeof rescue.longitude !== "number" || rescue.longitude < -180 || rescue.longitude > 180) {
-    throw new ValidationError("rescueRequest.longitude must be a number between -180 and 180")
+  if (!VALID_RESCUE_REQUEST_TYPES.includes(rescue.requestType)) {
+    throw new ValidationError(`rescueRequest.requestType must be one of: ${VALID_RESCUE_REQUEST_TYPES.join(", ")}`)
   }
 }
 
-async function forwardRescueRequest({ rescueRequest, incidentId, reportId, traceId }) {
+async function forwardRescueRequest({ rescueRequest, incidentId, reportId, reporterName, contactPhone, latitude, longitude, traceId }) {
 
   const payload = {
     incidentId: rescueRequest.incidentId || incidentId,
     requestType: rescueRequest.requestType,
     description: rescueRequest.description,
     peopleCount: 1,
-    latitude: rescueRequest.latitude,
-    longitude: rescueRequest.longitude,
-    contactName: rescueRequest.contactName,
-    contactPhone: rescueRequest.contactPhone,
+    latitude,
+    longitude,
+    contactName: reporterName,
+    contactPhone,
     sourceChannel: "OTHER",
     specialNeeds: "",
     locationDetails: rescueRequest.locationDetails || null,
@@ -389,7 +531,14 @@ async function forwardRescueRequest({ rescueRequest, incidentId, reportId, trace
     addressLine: rescueRequest.addressLine || null
   }
 
-  console.log("[forwardRescueRequest] Payload:", JSON.stringify(payload), "TraceId:", traceId)
+  const timer = startTimer()
+
+  logger.info("forwardRescueRequest sending payload", {
+    traceId,
+    reportId,
+    url: `${RESCUE_SERVICE_BASE_URL}/rescue-requests`,
+    payload
+  })
 
   const response = await fetch(`${RESCUE_SERVICE_BASE_URL}/rescue-requests`, {
     method: "POST",
@@ -401,17 +550,34 @@ async function forwardRescueRequest({ rescueRequest, incidentId, reportId, trace
   })
 
   const responseBody = await response.json()
-
-  console.log("[forwardRescueRequest] Response status:", response.status, "Body:", JSON.stringify(responseBody), "TraceId:", traceId)
+  const durationMs = timer.elapsed()
 
   if (!response.ok) {
-    console.error("[forwardRescueRequest] Error from rescue service — status:", response.status, "body:", JSON.stringify(responseBody), "TraceId:", traceId)
+    logger.error("forwardRescueRequest failed", {
+      traceId,
+      reportId,
+      httpStatus: response.status,
+      responseBody,
+      errorCode: responseBody?.error?.code || null,
+      errorMessage: responseBody?.error?.message || null,
+      durationMs
+    })
     throw new RescueServiceError(
       `Rescue service returned ${response.status}`,
       response.status,
       responseBody?.error || responseBody || null
     )
   }
+
+  logger.info("forwardRescueRequest success", {
+    traceId,
+    reportId,
+    httpStatus: response.status,
+    requestId: responseBody.requestId,
+    trackingCode: responseBody.trackingCode,
+    status: responseBody.status,
+    durationMs
+  })
 
   return {
     requestId: responseBody.requestId,
@@ -421,30 +587,55 @@ async function forwardRescueRequest({ rescueRequest, incidentId, reportId, trace
   }
 }
 
-async function updateReportWithRescueInfo(reportId, rescueResult) {
-
-  console.log("[updateReportWithRescueInfo] reportId:", reportId, "rescueResult:", JSON.stringify(rescueResult))
-
-  const params = {
-    TableName: TABLE_NAME,
-    Key: { reportId: { S: reportId } },
-    UpdateExpression: "SET rescueRequestId = :reqId, rescueTrackingCode = :tc, rescueStatus = :rs, rescueSubmittedAt = :rsa, updatedAt = :updatedAt",
-    ExpressionAttributeValues: {
-      ":reqId": { S: rescueResult.requestId || "" },
-      ":tc": { S: rescueResult.trackingCode || "" },
-      ":rs": { S: rescueResult.status || "" },
-      ":rsa": { S: rescueResult.submittedAt || "" },
-      ":updatedAt": { S: new Date().toISOString() }
+async function enqueueRescueRetry({ reportId, incidentId, rescueRequest, reporterName, contactPhone, latitude, longitude, traceId }) {
+  try {
+    // เก็บ payload ที่ครบพร้อม retry ได้เลย ไม่ต้องไปดึงข้อมูลเพิ่ม
+    const rescuePayload = {
+      incidentId: rescueRequest.incidentId || incidentId,
+      requestType: rescueRequest.requestType,
+      description: rescueRequest.description,
+      peopleCount: 1,
+      latitude,
+      longitude,
+      contactName: reporterName,
+      contactPhone,
+      sourceChannel: "OTHER",
+      specialNeeds: "",
+      locationDetails: rescueRequest.locationDetails || null,
+      province: rescueRequest.province || null,
+      district: rescueRequest.district || null,
+      subdistrict: rescueRequest.subdistrict || null,
+      addressLine: rescueRequest.addressLine || null
     }
-  }
 
-  await dynamoClient.send(new UpdateItemCommand(params))
+    const message = {
+      reportId,
+      traceId,
+      enqueuedAt: new Date().toISOString(),
+      rescuePayload
+    }
+
+    await sqsClient.send(new SendMessageCommand({
+      QueueUrl: RESCUE_RETRY_QUEUE_URL,
+      MessageBody: JSON.stringify(message)
+    }))
+
+    logger.info("enqueueRescueRetry success", { traceId, reportId })
+
+  } catch (sqsError) {
+    // SQS ล้มเหลว — log ไว้ แต่ไม่ throw เพื่อไม่ให้กระทบ response หลัก
+    logger.error("enqueueRescueRetry failed", {
+      traceId,
+      reportId,
+      errorMessage: sqsError.message,
+      stack: sqsError.stack
+    })
+  }
 }
 
-// --- DynamoDB / SNS Helpers ---
+// --- DynamoDB Helpers ---
 
 async function saveDamageReport(body, reportId, createdAt) {
-
   const params = {
     TableName: TABLE_NAME,
     Item: {
@@ -454,6 +645,8 @@ async function saveDamageReport(body, reportId, createdAt) {
       ownershipType: { S: body.ownershipType },
       description: { S: body.description },
       location: { S: body.location },
+      latitude: { N: String(body.latitude) },
+      longitude: { N: String(body.longitude) },
       reporterName: { S: body.reporterName },
       contactPhone: { S: body.contactPhone },
       evidenceUrl: { S: body.evidenceUrl || "" },
@@ -463,12 +656,10 @@ async function saveDamageReport(body, reportId, createdAt) {
       updatedAt: { S: createdAt }
     }
   }
-
   await dynamoClient.send(new PutItemCommand(params))
 }
 
 async function saveAgencyResponse(data) {
-
   const params = {
     TableName: AGENCY_RESPONSE_TABLE,
     Item: {
@@ -481,12 +672,10 @@ async function saveAgencyResponse(data) {
       createdAt: { S: data.now }
     }
   }
-
   await dynamoClient.send(new PutItemCommand(params))
 }
 
 async function updateReportHandled(reportId, agencyName) {
-
   const params = {
     TableName: TABLE_NAME,
     Key: { reportId: { S: reportId } },
@@ -497,45 +686,10 @@ async function updateReportHandled(reportId, agencyName) {
       ":updatedAt": { S: new Date().toISOString() }
     }
   }
-
   await dynamoClient.send(new UpdateItemCommand(params))
 }
 
-async function publishEventToSNS(body, reportId, createdAt, traceId) {
-
-  const eventPayload = {
-    eventType: "DamageReportForwarded",
-    eventId: crypto.randomUUID(),
-    traceId: traceId,
-    occurredAt: new Date().toISOString(),
-    data: {
-      reportId: reportId,
-      incidentId: body.incidentId,
-      damageType: body.damageType,
-      ownershipType: body.ownershipType,
-      description: body.description,
-      location: body.location,
-      reporterName: body.reporterName,
-      contactPhone: body.contactPhone,
-      evidenceUrl: body.evidenceUrl || "",
-      createdAt: createdAt
-    }
-  }
-
-  const params = {
-    TopicArn: TOPIC_ARN,
-    Message: JSON.stringify(eventPayload)
-  }
-
-  const result = await snsClient.send(new PublishCommand(params))
-
-  console.log("[publishEventToSNS] MessageId:", result.MessageId, "TraceId:", traceId)
-
-  return result.MessageId
-}
-
 async function updateReportStatus(reportId) {
-
   const params = {
     TableName: TABLE_NAME,
     Key: { reportId: { S: reportId } },
@@ -545,15 +699,75 @@ async function updateReportStatus(reportId) {
       ":updatedAt": { S: new Date().toISOString() }
     }
   }
-
   await dynamoClient.send(new UpdateItemCommand(params))
+}
+
+async function updateReportWithRescueInfo(reportId, rescueResult) {
+  const params = {
+    TableName: TABLE_NAME,
+    Key: { reportId: { S: reportId } },
+    UpdateExpression: "SET rescueRequestId = :reqId, rescueTrackingCode = :tc, rescueStatus = :rs, rescueSubmittedAt = :rsa, updatedAt = :updatedAt",
+    ExpressionAttributeValues: {
+      ":reqId": { S: rescueResult.requestId || "" },
+      ":tc": { S: rescueResult.trackingCode || "" },
+      ":rs": { S: rescueResult.status || "" },
+      ":rsa": { S: rescueResult.submittedAt || "" },
+      ":updatedAt": { S: new Date().toISOString() }
+    }
+  }
+  await dynamoClient.send(new UpdateItemCommand(params))
+}
+
+async function updateReportRescueFailed(reportId, error) {
+  const params = {
+    TableName: TABLE_NAME,
+    Key: { reportId: { S: reportId } },
+    UpdateExpression: "SET rescueStatus = :rs, rescueFailReason = :reason, updatedAt = :updatedAt",
+    ExpressionAttributeValues: {
+      ":rs": { S: "failed" },
+      ":reason": { S: error.message || "unknown error" },
+      ":updatedAt": { S: new Date().toISOString() }
+    }
+  }
+  await dynamoClient.send(new UpdateItemCommand(params))
+}
+
+// --- SNS Helper ---
+
+async function publishEventToSNS(body, reportId, createdAt, traceId) {
+  const eventPayload = {
+    eventType: "DamageReportForwarded",
+    eventId: crypto.randomUUID(),
+    traceId,
+    occurredAt: new Date().toISOString(),
+    data: {
+      reportId,
+      incidentId: body.incidentId,
+      damageType: body.damageType,
+      ownershipType: body.ownershipType,
+      description: body.description,
+      location: body.location,
+      reporterName: body.reporterName,
+      contactPhone: body.contactPhone,
+      evidenceUrl: body.evidenceUrl || "",
+      createdAt
+    }
+  }
+
+  const result = await snsClient.send(new PublishCommand({
+    TopicArn: TOPIC_ARN,
+    Message: JSON.stringify(eventPayload)
+  }))
+
+  logger.info("publishEventToSNS success", { traceId, reportId, messageId: result.MessageId })
+
+  return result.MessageId
 }
 
 // --- Validation ---
 
 function validateInput(body) {
-
-  const { incidentId, damageType, ownershipType, description, location, reporterName, contactPhone } = body
+  const { incidentId, damageType, ownershipType, description, location, reporterName, contactPhone, latitude, longitude } = body
 
   if (!incidentId || !description || !location || !reporterName || !contactPhone) {
     throw new ValidationError("missing required field")
@@ -569,14 +783,30 @@ function validateInput(body) {
   if (!validOwnershipType.includes(ownershipType)) {
     throw new ValidationError("invalid ownershipType")
   }
+
+  if (latitude === undefined || latitude === null) {
+    throw new ValidationError("missing required field: latitude")
+  }
+  if (longitude === undefined || longitude === null) {
+    throw new ValidationError("missing required field: longitude")
+  }
+  if (typeof latitude !== "number" || latitude < -90 || latitude > 90) {
+    throw new ValidationError("latitude must be a number between -90 and 90")
+  }
+  if (typeof longitude !== "number" || longitude < -180 || longitude > 180) {
+    throw new ValidationError("longitude must be a number between -180 and 180")
+  }
+
+  if (!/^\d{10}$/.test(contactPhone)) {
+    throw new ValidationError("contactPhone must be a 10-digit number")
+  }
 }
 
 // --- Response Builder ---
 
 function createResponse(statusCode, body, traceId) {
-
   return {
-    statusCode: statusCode,
+    statusCode,
     headers: {
       "Content-Type": "application/json",
       "Access-Control-Allow-Origin": "*",
