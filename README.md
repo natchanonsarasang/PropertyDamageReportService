@@ -18,7 +18,7 @@ Main components:
 
 # Project Structure
 
-```
+```text
 property-damage-report-service
 │
 ├── README.md
@@ -30,7 +30,11 @@ property-damage-report-service
 │   └── data-model.md
 │
 ├── lambda
-│   ├── createDamageReport.js
+│   ├── lambda-getincident
+│   │   └── index.js
+│   │
+│   └── lambda-request
+│       └── index.js
 │
 └── proposal
     └── proposal.pdf
@@ -39,39 +43,139 @@ property-damage-report-service
 ---
 
 # API Endpoints
-Base URL: https://zj5oc3gb5l.execute-api.us-east-1.amazonaws.com/v1
+Base URL: https://k8wz4waf1f.execute-api.us-east-1.amazonaws.com/v1
 
-## API Contract 1 Create Damage Report
+# API Contract 1 — Create Damage Report
 
 POST `/damage-reports`
 
-ใช้สำหรับให้ประชาชนส่งรายงานความเสียหายเข้าสู่ระบบ เมื่อบันทึกสำเร็จ ระบบจะสร้างข้อมูลใน Damage Report Master Data และหลังจากนั้นจะมีการ publish event แบบ asynchronous เพื่อส่งต่อหน่วยงานต่างๆที่เกี่ยวข้อง
+ใช้สำหรับให้ประชาชนส่งรายงานความเสียหายเข้าสู่ระบบ เมื่อบันทึกสำเร็จ ระบบจะสร้างข้อมูลใน Damage Report Master Data และ publish event แบบ asynchronous เพื่อส่งต่อข้อมูลไปยังหน่วยงานที่เกี่ยวข้อง
 
-Example request:
+ระบบรองรับการส่งคำร้องขอความช่วยเหลือฉุกเฉิน (rescueRequest) เพิ่มเติม เช่น การอพยพ หรือการช่วยเหลือทางการแพทย์
+
+---
+
+## Example 1 — Create Damage Report (Normal Report)
+
+```http
+POST /v1/damage-reports
+```
+
+### Request Body
 
 ```json
 {
-  "incidentId": "INC-2026-01",
+  "incidentId": "2FCBC2E0-5F71-44D1-A39B-15F0EDD5BB5C",
   "damageType": "building",
   "ownershipType": "personal",
-  "description": "Roof damaged after storm",
-  "location": "Rangsit, Pathum Thani",
-  "reporterName": "Somchai Jaidee",
+  "description": "หลังคาบ้านพังเสียหายจากพายุ",
+  "location": "123 ถนนสีลม บางรัก กรุงเทพมหานคร",
+  "reporterName": "สมชาย ใจดี",
   "contactPhone": "0812345678",
-  "evidenceUrl": "https://img.com/1.jpg"
+  "latitude": 13.7563,
+  "longitude": 100.5018,
+  "evidenceUrl": "https://img.example.com/damage1.jpg"
 }
-
 ```
 
-Example response:
+### Example Response
 
 ```json
 {
   "reportId": "REP-001",
-  "overallStatus": "new",
-  "createdAt": "2026-02-21T10:00:00Z"
+  "overallStatus": "NEW",
+  "createdAt": "2026-05-18T10:00:00Z"
 }
+```
 
+---
+
+## Example 2 — Create Damage Report with Rescue Request (MEDICAL)
+
+```http
+POST /v1/damage-reports
+```
+
+### Request Body
+
+```json
+{
+  "incidentId": "2FCBC2E0-5F71-44D1-A39B-15F0EDD5BB5C",
+  "damageType": "building",
+  "ownershipType": "personal",
+  "description": "บ้านพังเสียหายจากน้ำท่วม ติดอยู่ชั้น 2",
+  "location": "123 ถนนสีลม บางรัก กรุงเทพมหานคร",
+  "reporterName": "สมชาย ใจดี",
+  "contactPhone": "0812345678",
+  "latitude": 13.7563,
+  "longitude": 100.5018,
+  "evidenceUrl": "",
+  "rescueRequest": {
+    "requestType": "MEDICAL",
+    "description": "ผู้ป่วยสูงอายุติดอยู่ชั้น 2 เดินไม่ได้ ต้องการความช่วยเหลือด่วน",
+    "peopleCount": 2,
+    "locationDetails": "บ้านสีเหลืองข้างต้นไทร",
+    "province": "กรุงเทพมหานคร",
+    "district": "บางรัก",
+    "subdistrict": "บางรัก",
+    "addressLine": "123 ถนนสีลม"
+  }
+}
+```
+
+### Example Response
+
+```json
+{
+  "reportId": "REP-002",
+  "overallStatus": "PENDING_RESCUE",
+  "createdAt": "2026-05-18T10:10:00Z"
+}
+```
+
+---
+
+## Example 3 — Create Damage Report with Rescue Request (EVACUATION)
+
+```http
+POST /v1/damage-reports
+```
+
+### Request Body
+
+```json
+{
+  "incidentId": "2FCBC2E0-5F71-44D1-A39B-15F0EDD5BB5C",
+  "damageType": "infrastructure",
+  "ownershipType": "public",
+  "description": "ถนนพังทลาย น้ำท่วมสูง 2 เมตร ไม่สามารถออกได้",
+  "location": "ซอยลาดพร้าว 101 กรุงเทพมหานคร",
+  "reporterName": "วิชัย มีสุข",
+  "contactPhone": "0891234567",
+  "latitude": 13.8021,
+  "longitude": 100.6235,
+  "evidenceUrl": "",
+  "rescueRequest": {
+    "requestType": "EVACUATION",
+    "description": "ครอบครัว 5 คน รวมเด็ก 2 คน ติดอยู่ในบ้าน น้ำสูงถึงชั้น 1",
+    "peopleCount": 5,
+    "locationDetails": "บ้านหลังที่ 3 นับจากปากซอย",
+    "province": "กรุงเทพมหานคร",
+    "district": "ลาดพร้าว",
+    "subdistrict": "ลาดพร้าว",
+    "addressLine": "ซอยลาดพร้าว 101"
+  }
+}
+```
+
+### Example Response
+
+```json
+{
+  "reportId": "REP-003",
+  "overallStatus": "PENDING_RESCUE",
+  "createdAt": "2026-05-18T10:20:00Z"
+}
 ```
 
 ---
