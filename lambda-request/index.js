@@ -364,12 +364,23 @@ async function getAllReports(event, traceId) {
     reportId: item.reportId.S,
     incidentId: item.incidentId.S,
     damageType: item.damageType.S,
+    ownershipType: item.ownershipType.S,
     description: item.description.S,
     location: item.location.S,
+    latitude: item.latitude?.N ? parseFloat(item.latitude.N) : null,
+    longitude: item.longitude?.N ? parseFloat(item.longitude.N) : null,
+    reporterName: item.reporterName.S,
     contactPhone: item.contactPhone.S,
+    evidenceUrl: item.evidenceUrl?.S || null,
     overallStatus: item.overallStatus.S,
-    assignedAgency: item.assignedAgency?.S || null,
-    createdAt: item.createdAt.S
+    assignedAgency: item.assignedAgency?.S !== "none" ? item.assignedAgency?.S : null,
+    rescueStatus: item.rescueStatus?.S || null,
+    rescueFailReason: item.rescueFailReason?.S || null,
+    rescueRequestId: item.rescueRequestId?.S || null,
+    rescueTrackingCode: item.rescueTrackingCode?.S || null,
+    rescueSubmittedAt: item.rescueSubmittedAt?.S || null,
+    createdAt: item.createdAt.S,
+    updatedAt: item.updatedAt?.S || null
   }))
 
   let filtered = reports
@@ -413,12 +424,20 @@ async function getReportById(event, traceId) {
     ownershipType: item.ownershipType.S,
     description: item.description.S,
     location: item.location.S,
+    latitude: item.latitude?.N ? parseFloat(item.latitude.N) : null,  
+    longitude: item.longitude?.N ? parseFloat(item.longitude.N) : null, 
     reporterName: item.reporterName.S,
     contactPhone: item.contactPhone.S,
-    evidenceUrl: item.evidenceUrl.S,
+    evidenceUrl: item.evidenceUrl?.S || null,
     overallStatus: item.overallStatus.S,
-    assignedAgency: item.assignedAgency?.S || null,
-    createdAt: item.createdAt.S
+    assignedAgency: item.assignedAgency?.S !== "none" ? item.assignedAgency?.S : null,
+    rescueStatus: item.rescueStatus?.S || null,          
+    rescueFailReason: item.rescueFailReason?.S || null, 
+    rescueRequestId: item.rescueRequestId?.S || null,
+    rescueTrackingCode: item.rescueTrackingCode?.S || null, 
+    rescueSubmittedAt: item.rescueSubmittedAt?.S || null,  
+    createdAt: item.createdAt.S,
+    updatedAt: item.updatedAt?.S || null                  
   }
 
   if (item.rescueRequestId?.S) {
@@ -509,6 +528,11 @@ function validateRescueRequest(rescue, parentIncidentId) {
   if (!VALID_RESCUE_REQUEST_TYPES.includes(rescue.requestType)) {
     throw new ValidationError(`rescueRequest.requestType must be one of: ${VALID_RESCUE_REQUEST_TYPES.join(", ")}`)
   }
+  if (rescue.peopleCount !== undefined) {
+    if (!Number.isInteger(rescue.peopleCount) || rescue.peopleCount < 1) {
+      throw new ValidationError("rescueRequest.peopleCount must be a positive integer")
+    }
+  }
 }
 
 async function forwardRescueRequest({ rescueRequest, incidentId, reportId, reporterName, contactPhone, latitude, longitude, traceId }) {
@@ -517,7 +541,7 @@ async function forwardRescueRequest({ rescueRequest, incidentId, reportId, repor
     incidentId: rescueRequest.incidentId || incidentId,
     requestType: rescueRequest.requestType,
     description: rescueRequest.description,
-    peopleCount: 1,
+    peopleCount: rescueRequest.peopleCount || 1,
     latitude,
     longitude,
     contactName: reporterName,
@@ -594,7 +618,7 @@ async function enqueueRescueRetry({ reportId, incidentId, rescueRequest, reporte
       incidentId: rescueRequest.incidentId || incidentId,
       requestType: rescueRequest.requestType,
       description: rescueRequest.description,
-      peopleCount: 1,
+      peopleCount: rescueRequest.peopleCount || 1,
       latitude,
       longitude,
       contactName: reporterName,
