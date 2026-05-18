@@ -197,7 +197,7 @@ async function createDamageReport(event, traceId) {
     hasRescueRequest: !!body.rescueRequest
   })
 
-  // ── Validate ทุกอย่างก่อน ไม่มีการ save/publish จนกว่าจะผ่านหมด ──
+  // Validate 
 
   validateInput(body)
 
@@ -207,7 +207,7 @@ async function createDamageReport(event, traceId) {
     logger.info("createDamageReport rescueRequest validation passed", { traceId })
   }
 
-  // ── ผ่าน validate ทั้งหมดแล้ว ค่อยเริ่ม save ──
+  // validate 
 
   const reportId = "REP-" + Date.now()
   const createdAt = new Date().toISOString()
@@ -289,7 +289,7 @@ async function createDamageReport(event, traceId) {
       // บันทึก rescue status = failed ลง DynamoDB
       await updateReportRescueFailed(reportId, rescueError)
 
-      // ส่ง payload เข้า SQS เพื่อ retry ทีหลัง
+      
       await enqueueRescueRetry({
         reportId,
         incidentId: body.incidentId,
@@ -312,7 +312,7 @@ async function createDamageReport(event, traceId) {
     logger.info("Step 4: No rescueRequest, skipping", { traceId, reportId })
   }
 
-  // ── Build response — contract เหมือนเดิมทุกอย่าง ──
+  
 
   const responseBody = {
     reportId,
@@ -507,12 +507,12 @@ async function agencyResponse(event, traceId) {
   }, traceId)
 }
 
-// --- Rescue Request Helpers ---
+
 
 const VALID_RESCUE_REQUEST_TYPES = ["MEDICAL", "EVACUATION", "SUPPLY"]
 
 function validateRescueRequest(rescue, parentIncidentId) {
-  // incidentId — ใช้จาก rescueRequest ถ้ามี ไม่งั้น fallback จาก report ด้านบน
+ 
   const resolvedIncidentId = rescue.incidentId || parentIncidentId
   if (!resolvedIncidentId) {
     throw new ValidationError("rescueRequest missing required field: incidentId")
@@ -613,7 +613,7 @@ async function forwardRescueRequest({ rescueRequest, incidentId, reportId, repor
 
 async function enqueueRescueRetry({ reportId, incidentId, rescueRequest, reporterName, contactPhone, latitude, longitude, traceId }) {
   try {
-    // เก็บ payload ที่ครบพร้อม retry ได้เลย ไม่ต้องไปดึงข้อมูลเพิ่ม
+
     const rescuePayload = {
       incidentId: rescueRequest.incidentId || incidentId,
       requestType: rescueRequest.requestType,
@@ -647,7 +647,7 @@ async function enqueueRescueRetry({ reportId, incidentId, rescueRequest, reporte
     logger.info("enqueueRescueRetry success", { traceId, reportId })
 
   } catch (sqsError) {
-    // SQS ล้มเหลว — log ไว้ แต่ไม่ throw เพื่อไม่ให้กระทบ response หลัก
+  
     logger.error("enqueueRescueRetry failed", {
       traceId,
       reportId,
@@ -756,7 +756,7 @@ async function updateReportRescueFailed(reportId, error) {
   await dynamoClient.send(new UpdateItemCommand(params))
 }
 
-// --- SNS Helper ---
+
 
 async function publishEventToSNS(body, reportId, createdAt, traceId) {
   const eventPayload = {
